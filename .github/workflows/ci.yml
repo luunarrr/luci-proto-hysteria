@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  # No path filters. The repository contains no Markdown at all, so paths-ignore
+  # bought nothing -- and it cost the trigger entirely: evaluating a path filter
+  # needs a diff between the pushed range, and after a force-push that rewrites
+  # the only commit the previous head is unreachable, so no diff can be produced
+  # and the run is skipped. Amending this repository's single commit is the normal
+  # workflow here, which made every push silently do nothing -- and now that the
+  # only thing a push does is tell the feed to rebuild, a skipped run is a router
+  # left on the previous version with no failure anywhere.
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      is_release: ${{ steps.info.outputs.is_release }}
+      version: ${{ steps.info.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute build info
+        id: info
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            LATEST_TAG=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "v0.0.0")
+            echo "version=${LATEST_TAG#v}_git~${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ppp-multilink used to be built here. It is a rebuild of OpenWrt's own
+  # package and belongs to neither source repository, so it moved to
+  # luunarrr/openwrt-feed along with everything else that packages for a router.
+  # See that repository's ppp-multilink/README.md for what the patch fixes.
+  dispatch-feed:
+    name: Rebuild the feed
+    needs: [prepare]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch
+        env:
+          # GITHUB_TOKEN is scoped to this repository and cannot dispatch to
+          # another one, so this is a PAT with contents:write on the feed. It is
+          # held in a repository variable rather than a secret, and variables are
+          # not masked -- so register it with the runner before it is used, or
+          # any later step that dumps its environment puts a live token in a
+          # public log.
+          GH_TOKEN: ${{ secrets.FEED_DISPATCH_TOKEN }}
+          EVENT: ${{ needs.prepare.outputs.is_release == 'true' && 'release' || 'master' }}
+          SOURCE: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::FEED_DISPATCH_TOKEN is not set, so the feed will not rebuild"
+            exit 0
+          fi
+          echo "::add-mask::$GH_TOKEN"
+          gh api "repos/luunarrr/openwrt-feed/dispatches" \
+            -f "event_type=$EVENT" \
+            -f "client_payload[source]=$SOURCE" \
+            -f "client_payload[sha]=$SHA"
+
+  release:
+    name: Publish release
+    needs: [prepare]
+    if: needs.prepare.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # Notes only, no assets. The package is built in luunarrr/openwrt-feed,
+      # which resolves this repository's release channel from whatever
+      # releases/latest returns -- so cutting a release here is still exactly how
+      # a version of this package reaches a router, even though nothing is
+      # attached to it.
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "${{ github.ref_name }}"
+          generate_release_notes: true
+
+  cleanup:
+    name: Cleanup old runs
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    permissions:
+      actions: write
+
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 30
+          keep_minimum_runs: 5
