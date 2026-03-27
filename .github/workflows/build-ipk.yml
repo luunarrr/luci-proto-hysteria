@@ -1,0 +1,385 @@
+name: Build package
+
+on:
+  # No path filters. The repository contains no Markdown at all, so paths-ignore
+  # bought nothing -- and it cost the trigger entirely: evaluating a path filter
+  # needs a diff between the pushed range, and after a force-push that rewrites
+  # the only commit the previous head is unreachable, so no diff can be produced
+  # and the run is skipped. Amending this repository's single commit is the normal
+  # workflow here, which made every push silently build nothing.
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  # The firmware this is installed on. Pinning matters for more than the package
+  # format: apk records dependency constraints against the SDK's package versions,
+  # and a package built against a different release fails to install with nothing
+  # more useful than "uninstallable".
+  OPENWRT_VERSION: "25.12.5"
+  # PKGARCH:=all makes the built package architecture-independent, so one build
+  # serves every target and this only picks which SDK does the building.
+  SDK_ARCH: aarch64_cortex-a53
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      is_release: ${{ steps.info.outputs.is_release }}
+      version: ${{ steps.info.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute build info
+        id: info
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            LATEST_TAG=$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "v0.0.0")
+            echo "version=${LATEST_TAG#v}_git~${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The SDK action wants a package feed, which is a directory of
+      # <category>/<name>/Makefile. This repository is the package itself, so the
+      # feed is assembled here rather than committed in that shape.
+      - name: Assemble the package feed
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          sed -i "s/PKG_VERSION:=.*/PKG_VERSION:=${VERSION}/" Makefile
+
+          mkdir -p feed/luci/luci-proto-hysteria
+          cp -r Makefile htdocs feed/luci/luci-proto-hysteria/
+
+          # hysteria2-ppp is built from the sibling repository and is in no feed
+          # the SDK knows about, so DEPENDS on it cannot resolve. A placeholder
+          # carrying only the name satisfies it at build time; the real package is
+          # what gets installed on the device, and OpenWrt records no version
+          # constraint for a bare "+name" dependency.
+          mkdir -p feed/net/hysteria2-ppp
+          printf '%s\n' \
+            'include $(TOPDIR)/rules.mk' \
+            'PKG_NAME:=hysteria2-ppp' \
+            'PKG_VERSION:=0.0.0' \
+            'PKG_RELEASE:=1' \
+            'include $(INCLUDE_DIR)/package.mk' \
+            'define Package/hysteria2-ppp' \
+            '  SECTION:=net' \
+            '  CATEGORY:=Network' \
+            '  TITLE:=hysteria2-ppp (build-time placeholder)' \
+            'endef' \
+            'define Build/Compile' \
+            'endef' \
+            'define Package/hysteria2-ppp/install' \
+            '	true' \
+            'endef' \
+            '$(eval $(call BuildPackage,hysteria2-ppp))' \
+            > feed/net/hysteria2-ppp/Makefile
+
+      # The same action the sibling repository uses, where it builds this release
+      # for seven architectures successfully. The previous hand-rolled SDK setup
+      # ran "./scripts/feeds install -a", installing every package in every feed,
+      # which produced Kconfig cycles at defconfig time -- thousands of "recursive
+      # dependency detected" errors from unrelated packages such as curl and
+      # gensio. The action installs only what the named package needs.
+      - name: Build
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ env.SDK_ARCH }}-${{ env.OPENWRT_VERSION }}
+          FEED_DIR: ${{ github.workspace }}/feed
+          FEEDNAME: hysteria
+          PACKAGES: luci-proto-hysteria
+          INDEX: 1
+          V: s
+          # FEED_DIR sits inside the checkout, so the action's shfmt and git
+          # checks cannot work here -- the bind mount at /feed has no .git. The
+          # sibling repository carries the same note for the same reason.
+          NO_REFRESH_CHECK: 1
+          NO_SHFMT_CHECK: 1
+
+      - name: Collect package
+        id: collect
+        run: |
+          mkdir -p output
+          # Searched rather than assumed: an all-architecture package still lands
+          # under the building architecture's directory, and the extension is .apk
+          # from 25.12 but was .ipk before it.
+          find bin/ \( -name 'luci-proto-hysteria*.apk' -o -name 'luci-proto-hysteria*.ipk' \) \
+            -exec cp {} output/ \;
+          ls -la output/
+          echo "pkg_count=$(ls output/ 2>/dev/null | wc -l)" >> "$GITHUB_OUTPUT"
+
+      # The previous version gated the upload on a count that was always zero,
+      # because it looked only for .ipk while 25.12 emits .apk. The run went green
+      # having produced nothing at all, which is the failure worth making loud.
+      - name: Fail if nothing was produced
+        if: steps.collect.outputs.pkg_count == '0'
+        run: |
+          echo "::error::the build produced no package"
+          find bin/ -maxdepth 4 -type d 2>/dev/null | head -20
+          exit 1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-proto-hysteria
+          path: output/*
+          retention-days: 14
+
+  # A rebuild of OpenWrt's own ppp package carrying one extra patch, without
+  # which no member link can ever join a Multilink PPP bundle. See
+  # ppp-multilink/README.md for what is broken and ppp-multilink/patches/ for the
+  # derivation.
+  #
+  # Built here rather than in a repository of its own because the two are
+  # installed together: this is what makes the extra servers configured in the
+  # protocol page do anything at all.
+  build-ppp:
+    name: ppp-multilink ${{ matrix.arch }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Package architectures, not CPU architectures, and the same list the
+        # hysteria2-ppp repository builds -- a router needs both packages, so a
+        # target covered by one and not the other is of no use. Unlike
+        # luci-proto-hysteria this is compiled code, so it cannot be PKGARCH:=all
+        # and one build per target is unavoidable.
+        arch:
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - aarch64_generic
+          - arm_cortex-a7
+          - mipsel_24kc
+          - mips_24kc
+          - x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Taken from the release the firmware is pinned to rather than from
+      # OpenWrt's master. The patch stack, the pppd version and the source hash
+      # all have to be the ones this firmware was built with, or the result is a
+      # pppd that installs and then behaves unlike every other package on the box.
+      - name: Fetch OpenWrt's ppp package at the pinned release
+        run: |
+          set -eux
+          git clone --depth 1 --filter=blob:none --sparse \
+            --branch "v${OPENWRT_VERSION}" \
+            https://github.com/openwrt/openwrt.git openwrt-src
+          git -C openwrt-src sparse-checkout set package/network/services/ppp
+          mkdir -p feed/net
+          cp -r openwrt-src/package/network/services/ppp feed/net/ppp
+
+      - name: Add the IFUNIT fix
+        run: |
+          set -eux
+
+          # Refuse to ship a package built on a guess. If OpenWrt has fixed the
+          # ifdef upstream then 322 is redundant and would fail to apply anyway,
+          # and the honest outcome is a red build that says so rather than a
+          # silently unpatched pppd that gets installed and does not work.
+          if ! grep -q 'ifdef USE_TDB' \
+              feed/net/ppp/patches/321-multilink_support_custom_iface_names.patch; then
+            echo "::error::OpenWrt's patch 321 no longer contains the stale USE_TDB guard."
+            echo "::error::Re-check whether 322 is still needed before shipping this package."
+            exit 1
+          fi
+
+          cp ppp-multilink/patches/322-fix_ifunit_tdb_macro.patch feed/net/ppp/patches/
+
+          # Build the multilink variant rather than the plain one.
+          #
+          # ppp and ppp-multilink are two variants of this one directory, and the
+          # SDK action never writes CONFIG_PACKAGE_<name>=y -- it just runs
+          # "make package/<dir>/compile", which builds whichever variant is the
+          # default. OpenWrt declares no DEFAULT_VARIANT here, so the default is
+          # the first one defined, which is plain ppp: without this the job would
+          # produce a pppd with no multilink support at all, and the collect step
+          # below would then find nothing and fail.
+          sed -i '/^  VARIANT:=multilink$/a\  DEFAULT_VARIANT:=1' feed/net/ppp/Makefile
+          grep -A1 '^  VARIANT:=multilink$' feed/net/ppp/Makefile | grep -q 'DEFAULT_VARIANT:=1'
+
+          # apk upgrades on version-release order, so the rebuild has to outrank
+          # the stock package or "apk add" is a no-op on a router that already has
+          # it -- which is exactly how a hand reinstall of an equal version was
+          # found to silently change nothing during this bug's diagnosis.
+          CURRENT=$(sed -n 's/^PKG_RELEASE:=\([0-9]*\).*/\1/p' feed/net/ppp/Makefile)
+          test -n "$CURRENT"
+          sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=$((CURRENT + 1))/" feed/net/ppp/Makefile
+          grep -E '^PKG_(NAME|VERSION|RELEASE)' feed/net/ppp/Makefile
+
+      - name: Build
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.arch }}-${{ env.OPENWRT_VERSION }}
+          FEED_DIR: ${{ github.workspace }}/feed
+          FEEDNAME: hysteria
+          # The source directory, not the package. The action uses this value
+          # twice -- "feeds install $PKG" and "make package/$PKG/compile" -- so it
+          # has to be something both accept. "ppp-multilink" satisfies only the
+          # first: feeds resolves the variant to its directory and installs it as
+          # "ppp", after which the make target does not exist and the build stops
+          # with "No rule to make target 'package/ppp-multilink/download'". The
+          # variant is chosen by DEFAULT_VARIANT above instead.
+          PACKAGES: ppp
+          INDEX: 1
+          V: s
+          NO_REFRESH_CHECK: 1
+          NO_SHFMT_CHECK: 1
+
+      - name: Collect package
+        id: collect
+        run: |
+          mkdir -p output
+          find bin/ \( -name 'ppp-multilink*.apk' -o -name 'ppp-multilink*.ipk' \) \
+            -exec cp {} output/ \;
+          ls -la output/
+          echo "pkg_count=$(ls output/ 2>/dev/null | wc -l)" >> "$GITHUB_OUTPUT"
+
+      - name: Fail if nothing was produced
+        if: steps.collect.outputs.pkg_count == '0'
+        run: |
+          echo "::error::the build produced no ppp-multilink package"
+          find bin/ -maxdepth 4 -type d 2>/dev/null | head -20
+          exit 1
+
+      # Proof the artifact is the fixed multilink build rather than a stock or
+      # plain-ppp one that happened to land in the same directory.
+      #
+      # Deliberately not by unpacking the binary and looking for the IFUNIT
+      # string, which was the obvious check and does not work here. From 25.12
+      # OpenWrt emits apk v3 archives, which are not tar in any compression and
+      # cannot be opened without apk-tools v3; and the compiled pppd never leaves
+      # the build, because the SDK action mounts only the artifacts and feed
+      # directories into a container it then discards.
+      #
+      # What is left is sufficient, because the thing being guarded against
+      # cannot happen silently: OpenWrt's patch step is fatal, so a 322 that
+      # failed to apply fails the build rather than producing an unpatched
+      # package. The name and version below then establish the rest -- the
+      # package is named for its variant, so "ppp-multilink" proves the multilink
+      # build was selected, and the release bump proves this is our rebuild and
+      # not the stock package copied from the SDK's own index.
+      - name: Verify the artifact is the rebuild we intended
+        run: |
+          set -eu
+          ls -la output/
+
+          PKG=$(ls output/ | head -1)
+          case "$PKG" in
+            ppp-multilink-*) ;;
+            *) echo "::error::expected a ppp-multilink package, got '$PKG'"; exit 1 ;;
+          esac
+
+          # Must outrank whatever OpenWrt ships, or apk treats installing it as a
+          # no-op on a router that already has ppp-multilink at the stock release.
+          STOCK=$(sed -n 's/^PKG_RELEASE:=\([0-9]*\).*/\1/p' openwrt-src/package/network/services/ppp/Makefile)
+          case "$PKG" in
+            *-r$((STOCK + 1)).*) echo "ok: $PKG outranks stock r$STOCK" ;;
+            *) echo "::error::'$PKG' does not carry the expected release r$((STOCK + 1))"; exit 1 ;;
+          esac
+
+          # Informational only. Recorded so that if this ever needs to inspect the
+          # contents, the format is known rather than guessed at again.
+          echo "container magic:"
+          head -c 16 "output/$PKG" | od -An -tx1z || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppp-multilink-${{ matrix.arch }}
+          path: output/*
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: [prepare, build, build-ppp]
+    if: needs.prepare.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect all packages
+        id: collect
+        run: |
+          mkdir -p release
+          # ppp-multilink is compiled, so it is built once per architecture --
+          # but OpenWrt puts the architecture in the path it writes to and never
+          # in the file name, so all seven are called ppp-multilink-<ver>-r<n>.apk.
+          # Copying them flat keeps whichever landed last and drops the other six
+          # silently, which is how v0.1.0 shipped one. Worse than missing: the
+          # survivor looks installable and belongs to somebody else's router.
+          # luci-proto-hysteria is PKGARCH:=all, genuinely one file, so it is
+          # left alone rather than given a meaningless suffix.
+          for dir in artifacts/*/; do
+            [ -d "$dir" ] || continue
+            name=$(basename "$dir")
+            case "$name" in
+              ppp-multilink-*) suffix="_${name#ppp-multilink-}" ;;
+              *) suffix="" ;;
+            esac
+            for f in "$dir"*.apk "$dir"*.ipk; do
+              [ -e "$f" ] || continue
+              base=$(basename "$f")
+              if [ -n "$suffix" ]; then
+                cp "$f" "release/${base%.*}${suffix}.${base##*.}"
+              else
+                cp "$f" "release/${base}"
+              fi
+            done
+          done
+          ls -la release/
+          echo "pkg_count=$(ls release/ | wc -l)" >> "$GITHUB_OUTPUT"
+
+      # Every architecture built above has to reach the release, not just one.
+      - name: Fail if packages are missing
+        if: steps.collect.outputs.pkg_count == '0'
+        run: |
+          echo "::error::no package reached the release"
+          find artifacts -type f | head -20
+          exit 1
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "${{ github.ref_name }}"
+          generate_release_notes: true
+          files: release/*
+
+  cleanup:
+    name: Cleanup old runs
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    permissions:
+      actions: write
+
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 30
+          keep_minimum_runs: 5
